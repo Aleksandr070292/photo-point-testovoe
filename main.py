@@ -1,116 +1,102 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List
-from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
-from sqlalchemy.orm import declarative_base, sessionmaker
-from enum import Enum
+from typing import List, Optional
+import logging
 
-# Инициализация FastAPI приложения
-app = FastAPI(title="Incident Management API", 
-              description="API для учета инцидентов")
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Настройка базы данных SQLite
-SQLALCHEMY_DATABASE_URL = "sqlite:///./incidents.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+app = FastAPI(title="Сервис уведомлений", description="Сервис для отправки уведомлений через несколько каналов")
 
-# Модель статусов инцидентов
-class IncidentStatus(str, Enum):
-    NEW = "new"
-    IN_PROGRESS = "in_progress"
-    RESOLVED = "resolved"
-    CLOSED = "closed"
+# Модели Pydantic
+class NotificationRequest(BaseModel):
+    user_id: str
+    message: str
+    channels: List[str]  # email, sms, telegram
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    telegram_id: Optional[str] = None
 
-# Модель источников инцидентов
-class IncidentSource(str, Enum):
-    OPERATOR = "operator"
-    MONITORING = "monitoring"
-    PARTNER = "partner"
+class NotificationResponse(BaseModel):
+    success: bool
+    message: str
+    channel_used: str
 
-# Модель данных инцидента для базы данных
-class IncidentModel(Base):
-    __tablename__ = "incidents"
+# Мок сервиса SMS
+def send_sms(phone: str, message: str) -> bool:
+    """Функция отправки SMS (мок)"""
+    logger.info(f"Отправка SMS на {phone}: {message}")
+    # В реальной реализации здесь будет интеграция с API провайдера SMS
+    # Пока симулируем успешную отправку
+    return True  # Симуляция успешной отправки
+
+# Функция отправки email
+def send_email(email: str, message: str) -> bool:
+    """Функция отправки email (мок)"""
+    logger.info(f"Отправка email на {email}: {message}")
+    # В реальной реализации здесь будут использоваться настоящие настройки SMTP
+    # Пока симулируем успешную отправку
+    return True  # Симуляция успешной отправки
+
+# Мок сервиса Telegram
+def send_telegram(telegram_id: str, message: str) -> bool:
+    """Функция отправки сообщения в Telegram (мок)"""
+    logger.info(f"Отправка сообщения в Telegram {telegram_id}: {message}")
+    # В реальной реализации здесь будет интеграция с Telegram Bot API
+    # Пока симулируем успешную отправку
+    return True  # Симуляция успешной отправки
+
+# Порядок приоритета каналов
+CHANNEL_PRIORITY = ["email", "sms", "telegram"]
+
+@app.post("/notify/", response_model=NotificationResponse)
+async def send_notification(request: NotificationRequest):
+    """
+    Отправка уведомления через доступные каналы с механизмом резервирования.
+    Если один канал не работает, пробуем следующий в порядке приоритета.
+    """
+    if not request.channels:
+        raise HTTPException(status_code=400, detail="Необходимо указать хотя бы один канал")
     
-    id = Column(Integer, primary_key=True, index=True)
-    description = Column(String, nullable=False)
-    status = Column(String, default=IncidentStatus.NEW, nullable=False)
-    source = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-# Создание таблиц в базе данных
-Base.metadata.create_all(bind=engine)
-
-# Pydantic модели для валидации данных
-class IncidentCreate(BaseModel):
-    description: str
-    source: IncidentSource
+    # Проверка обязательных полей для указанных каналов
+    for channel in request.channels:
+        if channel == "email" and not request.email:
+            raise HTTPException(status_code=400, detail="Требуется адрес email для email-уведомлений")
+        elif channel == "sms" and not request.phone:
+            raise HTTPException(status_code=400, detail="Требуется номер телефона для SMS-уведомлений")
+        elif channel == "telegram" and not request.telegram_id:
+            raise HTTPException(status_code=400, detail="Требуется ID Telegram для Telegram-уведомлений")
     
-    class Config:
-        use_enum_values = True
-
-class IncidentUpdate(BaseModel):
-    status: IncidentStatus
+    # Пробуем каналы в порядке приоритета
+    for channel in CHANNEL_PRIORITY:
+        if channel in request.channels:
+            success = False
+            try:
+                if channel == "email" and request.email:
+                    success = send_email(request.email, request.message)
+                elif channel == "sms" and request.phone:
+                    success = send_sms(request.phone, request.message)
+                elif channel == "telegram" and request.telegram_id:
+                    success = send_telegram(request.telegram_id, request.message)
+                
+                if success:
+                    return NotificationResponse(
+                        success=True,
+                        message=f"Уведомление успешно отправлено через {channel}",
+                        channel_used=channel
+                    )
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление через {channel}: {str(e)}")
+                continue  # Пробуем следующий канал
     
-    class Config:
-        use_enum_values = True
+    # Если мы дошли до этой точки, значит все каналы не сработали
+    raise HTTPException(status_code=500, detail="Не удалось отправить уведомление ни через один канал")
 
-class IncidentResponse(BaseModel):
-    id: int
-    description: str
-    status: IncidentStatus
-    source: IncidentSource
-    created_at: datetime
-    
-    class Config:
-        use_enum_values = True
-        from_attributes = True
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
-# Зависимость для получения сессии базы данных
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# Эндпоинт для создания инцидента
-@app.post("/incidents/", response_model=IncidentResponse, status_code=201)
-def create_incident(incident: IncidentCreate):
-    db = next(get_db())
-    db_incident = IncidentModel(
-        description=incident.description,
-        source=incident.source,
-        status=IncidentStatus.NEW
-    )
-    db.add(db_incident)
-    db.commit()
-    db.refresh(db_incident)
-    return db_incident
-
-# Эндпоинт для получения списка инцидентов с фильтром по статусу
-@app.get("/incidents/", response_model=List[IncidentResponse])
-def get_incidents(status: Optional[IncidentStatus] = Query(None)):
-    db = next(get_db())
-    query = db.query(IncidentModel)
-    if status:
-        query = query.filter(IncidentModel.status == status)
-    return query.all()
-
-# Эндпоинт для обновления статуса инцидента по id
-@app.patch("/incidents/{incident_id}", response_model=IncidentResponse)
-def update_incident_status(incident_id: int, incident_update: IncidentUpdate):
-    db = next(get_db())
-    db_incident = db.query(IncidentModel).filter(IncidentModel.id == incident_id).first()
-    if not db_incident:
-        raise HTTPException(status_code=404, detail="Incident not found")
-    db_incident.status = incident_update.status
-    db.commit()
-    db.refresh(db_incident)
-    return db_incident
-
-# Корневой эндпоинт для проверки работы API
-@app.get("/")
-def read_root():
-    return {"message": "Incident Management API"}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
